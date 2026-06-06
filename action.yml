@@ -1,0 +1,152 @@
+name: "license-auditor"
+description: "Fail the build when a dependency's license is on a denylist (or not on an allowlist). License compliance check for npm and Python in CI."
+author: "amoussa1229"
+branding:
+  icon: "shield"
+  color: "yellow"
+
+inputs:
+  ecosystem:
+    description: >-
+      Which package ecosystem to scan: "npm", "python", or "auto" (detect by
+      the files present in working-directory). When both npm and Python files
+      are present, "auto" scans both.
+    required: false
+    default: "auto"
+  allow:
+    description: >-
+      Allowlist of SPDX license ids, comma- and/or whitespace-separated. When
+      non-empty it takes precedence: a package violates when none of its
+      license options are allowed. Leave empty to use the denylist instead.
+    required: false
+    default: ""
+  deny:
+    description: >-
+      Denylist of SPDX license ids, comma- and/or whitespace-separated. Used
+      only when "allow" is empty. Provide at least one of allow/deny.
+    required: false
+    default: ""
+  working-directory:
+    description: "Directory to scan. The scanner runs here and ecosystem auto-detection looks here."
+    required: false
+    default: "."
+  fail-on-violation:
+    description: >-
+      When "true" (default) the action exits non-zero if any violation is
+      found (after writing outputs). When "false" it reports only.
+    required: false
+    default: "true"
+  include-dev:
+    description: >-
+      npm only: when "false" (default) only production dependencies are
+      scanned (maps to license-checker --production). When "true" devDeps are
+      included. Ignored for Python.
+    required: false
+    default: "false"
+
+outputs:
+  violations:
+    description: >-
+      JSON array of violation objects: {package, version, license, reason}.
+    value: ${{ steps.audit.outputs.violations }}
+  violation-count:
+    description: "Number of violations found (string integer)."
+    value: ${{ steps.audit.outputs.violation-count }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate inputs and detect ecosystems
+      id: detect
+      shell: bash
+      env:
+        INPUT_ECOSYSTEM: ${{ inputs.ecosystem }}
+        INPUT_ALLOW: ${{ inputs.allow }}
+        INPUT_DENY: ${{ inputs.deny }}
+        INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        INPUT_FAIL_ON_VIOLATION: ${{ inputs.fail-on-violation }}
+        INPUT_INCLUDE_DEV: ${{ inputs.include-dev }}
+      run: |
+        set -euo pipefail
+
+        case "$INPUT_ECOSYSTEM" in
+          npm|python|auto) ;;
+          *) echo 'Input "ecosystem" must be one of: npm, python, auto.' >&2; exit 1 ;;
+        esac
+        case "$INPUT_FAIL_ON_VIOLATION" in
+          true|false) ;;
+          *) echo 'Input "fail-on-violation" must be "true" or "false".' >&2; exit 1 ;;
+        esac
+        case "$INPUT_INCLUDE_DEV" in
+          true|false) ;;
+          *) echo 'Input "include-dev" must be "true" or "false".' >&2; exit 1 ;;
+        esac
+        if [ -z "${INPUT_ALLOW// /}" ] && [ -z "${INPUT_DENY// /}" ]; then
+          echo 'Input "allow"/"deny" must include at least one SPDX id (provide allow, deny, or both).' >&2
+          exit 1
+        fi
+        if [ ! -d "$INPUT_WORKING_DIRECTORY" ]; then
+          echo "Input \"working-directory\" must be an existing directory: $INPUT_WORKING_DIRECTORY" >&2
+          exit 1
+        fi
+
+        run_npm=false
+        run_python=false
+        wd="$INPUT_WORKING_DIRECTORY"
+        case "$INPUT_ECOSYSTEM" in
+          npm) run_npm=true ;;
+          python) run_python=true ;;
+          auto)
+            if [ -f "$wd/package.json" ]; then run_npm=true; fi
+            if [ -f "$wd/requirements.txt" ] || [ -f "$wd/pyproject.toml" ]; then run_python=true; fi
+            if [ "$run_npm" = false ] && [ "$run_python" = false ]; then
+              echo "Input \"ecosystem\" is \"auto\" but no package.json, requirements.txt, or pyproject.toml was found in: $wd" >&2
+              exit 1
+            fi
+            ;;
+        esac
+
+        echo "run-npm=$run_npm" >> "$GITHUB_OUTPUT"
+        echo "run-python=$run_python" >> "$GITHUB_OUTPUT"
+
+    - name: Scan npm dependencies
+      id: scan-npm
+      if: steps.detect.outputs.run-npm == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        INPUT_INCLUDE_DEV: ${{ inputs.include-dev }}
+      run: |
+        set -euo pipefail
+        out="$(mktemp)"
+        prod_flag=""
+        if [ "$INPUT_INCLUDE_DEV" != "true" ]; then
+          prod_flag="--production"
+        fi
+        npx --yes license-checker@25.0.1 --json --excludePrivatePackages $prod_flag > "$out"
+        echo "json-path=$out" >> "$GITHUB_OUTPUT"
+
+    - name: Scan Python dependencies
+      id: scan-python
+      if: steps.detect.outputs.run-python == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+        out="$(mktemp)"
+        python3 -m pip install --quiet "pip-licenses==5.*"
+        python3 -m piplicenses --format=json > "$out"
+        echo "json-path=$out" >> "$GITHUB_OUTPUT"
+
+    - name: Audit licenses
+      id: audit
+      shell: bash
+      env:
+        LICENSE_AUDITOR_ALLOW: ${{ inputs.allow }}
+        LICENSE_AUDITOR_DENY: ${{ inputs.deny }}
+        LICENSE_AUDITOR_FAIL_ON_VIOLATION: ${{ inputs.fail-on-violation }}
+        LICENSE_AUDITOR_NPM_JSON: ${{ steps.scan-npm.outputs.json-path }}
+        LICENSE_AUDITOR_PYTHON_JSON: ${{ steps.scan-python.outputs.json-path }}
+      run: |
+        set -euo pipefail
+        node "$GITHUB_ACTION_PATH/src/audit.js"
