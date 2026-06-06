@@ -1,5 +1,5 @@
 name: "license-auditor"
-description: "Fail the build when a dependency's license is on a denylist (or not on an allowlist). License compliance check for npm and Python in CI."
+description: "Fail the build when a dependency's license violates an allow/deny policy. npm and Python license compliance in CI."
 author: "amoussa1229"
 branding:
   icon: "shield"
